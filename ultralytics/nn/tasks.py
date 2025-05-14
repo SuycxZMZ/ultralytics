@@ -68,7 +68,15 @@ from ultralytics.nn.modules import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    C2f_DCMB,
+    C2f_Faster,
+    C3_Faster,
+    C2f_DCMB_Mamba
 )
+from ultralytics.nn.modules.extra_blocks import C2f_DCMB_Mamba
+
+from .extra_modules import *
+
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
@@ -1409,6 +1417,13 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             SCDown,
             C2fCIB,
             A2C2f,
+            C2f_DCMB,
+            C2f_Faster,
+            C3_Faster,
+            VSSBlock_YOLO,
+            VisionClueMerge,
+            SimpleStem,
+            C2f_DCMB_Mamba
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1428,6 +1443,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C2fCIB,
             C2PSA,
             A2C2f,
+            C2f_DCMB,
+            C2f_Faster,
+            C3_Faster,
+            VSSBlock_YOLO,
+            C2f_DCMB_Mamba
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args

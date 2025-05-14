@@ -1,0 +1,310 @@
+from .conv import *
+from .block import *
+from ..extra_modules import VSSBlock, VSSBlock_YOLO
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from functools import partial
+
+from ultralytics.utils.torch_utils import fuse_conv_and_bn
+from .transformer import TransformerBlock
+__all__ = ['C2f_DCMB', 'C3_Faster', 'C2f_Faster', 'C3_Faster_CGLU', 'C2f_Faster_CGLU', 'C2f_DCMB_Mamba']
+
+######################################## TransNeXt Convolutional GLU start ########################################
+
+class ConvolutionalGLU(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.) -> None:
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        hidden_features = int(2 * hidden_features / 3)
+        self.fc1 = nn.Conv2d(in_features, hidden_features * 2, 1)
+        self.dwconv = nn.Sequential(
+            nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1, padding=1, bias=True, groups=hidden_features),
+            act_layer()
+        )
+        self.fc2 = nn.Conv2d(hidden_features, out_features, 1)
+        self.drop = nn.Dropout(drop)
+    
+    # def forward(self, x):
+    #     x, v = self.fc1(x).chunk(2, dim=1)
+    #     x = self.dwconv(x) * v
+    #     x = self.drop(x)
+    #     x = self.fc2(x)
+    #     x = self.drop(x)
+    #     return x
+
+    def forward(self, x):
+        x_shortcut = x
+        x, v = self.fc1(x).chunk(2, dim=1)
+        x = self.dwconv(x) * v
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x_shortcut + x
+
+class Faster_Block_CGLU(nn.Module):
+    def __init__(self,
+                 inc,
+                 dim,
+                 n_div=4,
+                 mlp_ratio=2,
+                 drop_path=0.1,
+                 layer_scale_init_value=0.0,
+                 pconv_fw_type='split_cat'
+                 ):
+        super().__init__()
+        self.dim = dim
+        self.mlp_ratio = mlp_ratio
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.n_div = n_div
+
+        self.mlp = ConvolutionalGLU(dim)
+
+        self.spatial_mixing = Partial_conv3(
+            dim,
+            n_div,
+            pconv_fw_type
+        )
+        
+        self.adjust_channel = None
+        if inc != dim:
+            self.adjust_channel = Conv(inc, dim, 1)
+
+        if layer_scale_init_value > 0:
+            self.layer_scale = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
+            self.forward = self.forward_layer_scale
+        else:
+            self.forward = self.forward
+
+    def forward(self, x):
+        if self.adjust_channel is not None:
+            x = self.adjust_channel(x)
+        shortcut = x
+        x = self.spatial_mixing(x)
+        x = shortcut + self.drop_path(self.mlp(x))
+        return x
+
+    def forward_layer_scale(self, x):
+        shortcut = x
+        x = self.spatial_mixing(x)
+        x = shortcut + self.drop_path(
+            self.layer_scale.unsqueeze(-1).unsqueeze(-1) * self.mlp(x))
+        return x
+
+class C3_Faster_CGLU(C3):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(Faster_Block_CGLU(c_, c_) for _ in range(n)))
+
+class C2f_Faster_CGLU(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(Faster_Block_CGLU(self.c, self.c) for _ in range(n))
+
+######################################## TransNeXt Convolutional GLU end ########################################
+
+######################################## DynamicConvMixerBlock start ########################################
+
+class DynamicInceptionDWConv2d(nn.Module):
+    """ Dynamic Inception depthweise convolution
+    """
+    def __init__(self, in_channels, square_kernel_size=3, band_kernel_size=11):
+        super().__init__()
+        self.dwconv = nn.ModuleList([
+            nn.Conv2d(in_channels, in_channels, square_kernel_size, padding=square_kernel_size//2, groups=in_channels),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(1, band_kernel_size), padding=(0, band_kernel_size//2), groups=in_channels),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(band_kernel_size, 1), padding=(band_kernel_size//2, 0), groups=in_channels)
+        ])
+        
+        self.bn = nn.BatchNorm2d(in_channels)
+        self.act = nn.SiLU()
+        
+        # Dynamic Kernel Weights
+        self.dkw = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, in_channels * 3, 1)
+        )
+        
+    def forward(self, x):
+        x_dkw = rearrange(self.dkw(x), 'bs (g ch) h w -> g bs ch h w', g=3)
+        x_dkw = F.softmax(x_dkw, dim=0)
+        x = torch.stack([self.dwconv[i](x) * x_dkw[i] for i in range(len(self.dwconv))]).sum(0)
+        return self.act(self.bn(x))
+
+class DynamicInceptionMixer(nn.Module):
+    def __init__(self, channel=256, kernels=[3, 5]):
+        super().__init__()
+        self.groups = len(kernels)
+        min_ch = channel // 2
+        
+        self.convs = nn.ModuleList([])
+        for ks in kernels:
+            self.convs.append(DynamicInceptionDWConv2d(min_ch, ks, ks * 3 + 2))
+        self.conv_1x1 = Conv(channel, channel, k=1)
+        
+    def forward(self, x):
+        _, c, _, _ = x.size()
+        x_group = torch.split(x, [c // 2, c // 2], dim=1)
+        x_group = torch.cat([self.convs[i](x_group[i]) for i in range(len(self.convs))], dim=1)
+        x = self.conv_1x1(x_group)
+        return x
+
+class DynamicIncMixerBlock(nn.Module):
+    def __init__(self, dim, drop_path=0.0):
+        super().__init__()
+        self.norm1 = nn.BatchNorm2d(dim)
+        self.norm2 = nn.BatchNorm2d(dim)
+        self.mixer = DynamicInceptionMixer(dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.mlp = ConvolutionalGLU(dim)
+        layer_scale_init_value = 1e-2            
+        self.layer_scale_1 = nn.Parameter(
+            layer_scale_init_value * torch.ones((dim)), requires_grad=True)
+        self.layer_scale_2 = nn.Parameter(
+            layer_scale_init_value * torch.ones((dim)), requires_grad=True)
+
+    def forward(self, x):
+        x = x + self.drop_path(self.layer_scale_1.unsqueeze(-1).unsqueeze(-1) * self.mixer(self.norm1(x)))
+        x = x + self.drop_path(self.layer_scale_2.unsqueeze(-1).unsqueeze(-1) * self.mlp(self.norm2(x)))
+        return x
+
+class DynamicIncMixerBlock_Mamba(nn.Module):
+    def __init__(self, dim, drop_path=0.0, d_state=16, **kwargs):
+        super().__init__()
+        self.norm1 = nn.BatchNorm2d(dim)
+        self.norm2 = nn.BatchNorm2d(dim)
+        self.mixer = DynamicInceptionMixer(dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.mlp = VSSBlock(
+            hidden_dim=dim,
+            drop_path=drop_path,
+            norm_layer=partial(nn.LayerNorm, eps=1e-6),
+            d_state=d_state,
+            **kwargs
+        )
+        layer_scale_init_value = 1e-2            
+        self.layer_scale_1 = nn.Parameter(
+            layer_scale_init_value * torch.ones((dim)), requires_grad=True)
+        self.layer_scale_2 = nn.Parameter(
+            layer_scale_init_value * torch.ones((dim)), requires_grad=True)
+
+    def forward(self, x):
+        # 第一分支：mixer
+        x = x + self.drop_path(self.layer_scale_1.unsqueeze(-1).unsqueeze(-1) * self.mixer(self.norm1(x)))
+        # 第二分支：mlp (VSSBlock)
+        x_norm = self.norm2(x)  # (B, C, H, W)
+        x_mlp = self.mlp(x_norm)  # VSSBlock 内部处理维度转换并输出 (B, C, H, W)
+        x = x + self.drop_path(self.layer_scale_2.unsqueeze(-1).unsqueeze(-1) * x_mlp)
+        return x
+class C2f_DCMB(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(DynamicIncMixerBlock(self.c) for _ in range(n))
+
+class C2f_DCMB_Mamba(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(DynamicIncMixerBlock_Mamba(self.c) for _ in range(n))
+######################################## DynamicConvMixerBlock end ########################################
+
+######################################## C2f-Faster begin ########################################
+
+from timm.models.layers import DropPath
+class Partial_conv3(nn.Module):
+    def __init__(self, dim, n_div=4, forward='split_cat'):
+        super().__init__()
+        self.dim_conv3 = dim // n_div
+        self.dim_untouched = dim - self.dim_conv3
+        self.partial_conv3 = nn.Conv2d(self.dim_conv3, self.dim_conv3, 3, 1, 1, bias=False)
+
+        if forward == 'slicing':
+            self.forward = self.forward_slicing
+        elif forward == 'split_cat':
+            self.forward = self.forward_split_cat
+        else:
+            raise NotImplementedError
+
+    def forward_slicing(self, x):
+        # only for inference
+        x = x.clone()   # !!! Keep the original input intact for the residual connection later
+        x[:, :self.dim_conv3, :, :] = self.partial_conv3(x[:, :self.dim_conv3, :, :])
+        return x
+
+    def forward_split_cat(self, x):
+        # for training/inference
+        x1, x2 = torch.split(x, [self.dim_conv3, self.dim_untouched], dim=1)
+        x1 = self.partial_conv3(x1)
+        x = torch.cat((x1, x2), 1)
+        return x
+
+class Faster_Block(nn.Module):
+    def __init__(self,
+                 inc,
+                 dim,
+                 n_div=4,
+                 mlp_ratio=2,
+                 drop_path=0.1,
+                 layer_scale_init_value=0.0,
+                 pconv_fw_type='split_cat'
+                 ):
+        super().__init__()
+        self.dim = dim
+        self.mlp_ratio = mlp_ratio
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.n_div = n_div
+
+        mlp_hidden_dim = int(dim * mlp_ratio)
+
+        mlp_layer = [
+            Conv(dim, mlp_hidden_dim, 1),
+            nn.Conv2d(mlp_hidden_dim, dim, 1, bias=False)
+        ]
+
+        self.mlp = nn.Sequential(*mlp_layer)
+
+        self.spatial_mixing = Partial_conv3(
+            dim,
+            n_div,
+            pconv_fw_type
+        )
+        
+        self.adjust_channel = None
+        if inc != dim:
+            self.adjust_channel = Conv(inc, dim, 1)
+
+        if layer_scale_init_value > 0:
+            self.layer_scale = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
+            self.forward = self.forward_layer_scale
+        else:
+            self.forward = self.forward
+
+    def forward(self, x):
+        if self.adjust_channel is not None:
+            x = self.adjust_channel(x)
+        shortcut = x
+        x = self.spatial_mixing(x)
+        x = shortcut + self.drop_path(self.mlp(x))
+        return x
+
+    def forward_layer_scale(self, x):
+        shortcut = x
+        x = self.spatial_mixing(x)
+        x = shortcut + self.drop_path(
+            self.layer_scale.unsqueeze(-1).unsqueeze(-1) * self.mlp(x))
+        return x
+
+class C3_Faster(C3):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(Faster_Block(c_, c_) for _ in range(n)))
+
+class C2f_Faster(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(Faster_Block(self.c, self.c) for _ in range(n))
+
+######################################## C2f-Faster end ########################################

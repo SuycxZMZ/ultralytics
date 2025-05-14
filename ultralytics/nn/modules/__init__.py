@@ -102,6 +102,8 @@ from .transformer import (
     TransformerLayer,
 )
 
+from .extra_blocks import *
+
 __all__ = (
     "Conv",
     "Conv2",
@@ -179,4 +181,8 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
+    "C2f_DCMB", 
+    "C3_Faster", 
+    "C2f_Faster",
+    "C2f_DCMB_Mamba"
 )
