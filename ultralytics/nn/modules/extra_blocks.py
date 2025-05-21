@@ -7,11 +7,14 @@ import torch.nn.functional as F
 from einops import rearrange
 from functools import partial
 from .attention import DualDomainSelectionMechanism
+from .camixer import CAMixer
+from .efficientvim import *
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 from .transformer import TransformerBlock
 __all__ = ['C2f_DCMB', 'C3_Faster', 'C2f_Faster', 'C3_Faster_CGLU', 'C2f_Faster_CGLU', 'C2f_DCMB_Mamba',
-           'CSP_MutilScaleEdgeInformationEnhance', 'CSP_MutilScaleEdgeInformationSelect']
+           'CSP_MutilScaleEdgeInformationEnhance', 'CSP_MutilScaleEdgeInformationSelect',
+           'MANet', 'C2f_CAMixer']
 
 ######################################## TransNeXt Convolutional GLU start ########################################
 
@@ -397,3 +400,61 @@ class CSP_MutilScaleEdgeInformationSelect(C2f):
         self.m = nn.ModuleList(MutilScaleEdgeInformationSelect(self.c, [3, 6, 9, 12]) for _ in range(n))
 
 ######################################## MutilScaleEdgeInformationEnhance end ########################################
+
+######################################## CAMixer start ########################################
+
+class C2f_CAMixer(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(CAMixer(self.c, window_size=4) for _ in range(n))
+
+######################################## CAMixer end ########################################
+
+######################################## Hyper-YOLO start ########################################
+
+class MANet(nn.Module):
+
+    def __init__(self, c1, c2, n=1, shortcut=False, p=1, kernel_size=3, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv_first = Conv(c1, 2 * self.c, 1, 1)
+        self.cv_final = Conv((4 + n) * self.c, c2, 1)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.cv_block_1 = Conv(2 * self.c, self.c, 1, 1)
+        dim_hid = int(p * 2 * self.c)
+        self.cv_block_2 = nn.Sequential(Conv(2 * self.c, dim_hid, 1, 1), DWConv(dim_hid, dim_hid, kernel_size, 1),
+                                      Conv(dim_hid, self.c, 1, 1))
+
+    def forward(self, x):
+        y = self.cv_first(x)
+        y0 = self.cv_block_1(y)
+        y1 = self.cv_block_2(y)
+        y2, y3 = y.chunk(2, 1)
+        y = list((y0, y1, y2, y3))
+        y.extend(m(y[-1]) for m in self.m)
+
+        return self.cv_final(torch.cat(y, 1))
+
+class MANet_FasterBlock(MANet):
+    def __init__(self, c1, c2, n=1, shortcut=False, p=1, kernel_size=3, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, p, kernel_size, g, e)
+        self.m = nn.ModuleList(Faster_Block(self.c, self.c) for _ in range(n))
+
+class MANet_FasterCGLU(MANet):
+    def __init__(self, c1, c2, n=1, shortcut=False, p=1, kernel_size=3, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, p, kernel_size, g, e)
+        self.m = nn.ModuleList(Faster_Block_CGLU(self.c, self.c) for _ in range(n))
+
+######################################## CVPR2025 EfficientViM start ########################################
+
+class C2f_EfficientVIM(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(EfficientViMBlock(self.c) for _ in range(n))
+
+class C2f_EfficientVIM_CGLU(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(EfficientViMBlock_CGLU(self.c) for _ in range(n))
+
+######################################## CVPR2025 EfficientViM end ########################################

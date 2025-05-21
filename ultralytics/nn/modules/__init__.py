@@ -103,6 +103,8 @@ from .transformer import (
 )
 
 from .extra_blocks import *
+from .camixer import CAMixer
+from .efficientvim import *
 
 __all__ = (
     "Conv",
@@ -186,5 +188,8 @@ __all__ = (
     "C2f_Faster",
     "C2f_DCMB_Mamba",
     "CSP_MutilScaleEdgeInformationEnhance",
-    "CSP_MutilScaleEdgeInformationSelect"
+    "CSP_MutilScaleEdgeInformationSelect",
+    "CAMixer",
+    "MANet",
+    "C2f_CAMixer",
 )
