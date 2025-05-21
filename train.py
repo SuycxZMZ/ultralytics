@@ -3,17 +3,17 @@ warnings.filterwarnings('ignore')
 from ultralytics import YOLO
 
 if __name__ == '__main__':
-    model = YOLO('ultralytics/cfg/models/v8/yolov8n.yaml')
+    model = YOLO(r'G:\Code\ultralytics\ultralytics\cfg\models\CustomCfg\yolo11-C2f-MutilScaleEdgeEnhance.yaml')
     # model.load('yolov8n.pt') # loading pretrain weights
     model.train(data='coco128.yaml',
                 cache=False,
                 imgsz=640,
-                epochs=300,
-                batch=32,
+                epochs=10,
+                batch=4,
                 close_mosaic=0,
-                workers=8, # Windows下出现莫名其妙卡主的情况可以尝试把workers设置为0
+                workers=0, # Windows下出现莫名其妙卡主的情况可以尝试把workers设置为0, Linux服务器一般设8
                 optimizer='SGD', # using SGD
-                # device='0,1', # 指定显卡和多卡训练参考<YOLOV8V10配置文件.md>下方常见错误和解决方案
+                device='0',
                 # patience=0, # set 0 to close earlystop.
                 # resume=True, # 断点续训,YOLO初始化时选择last.pt,例如YOLO('last.pt')
                 # amp=False, # close amp
