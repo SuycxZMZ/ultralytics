@@ -6,10 +6,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from functools import partial
+from .attention import DualDomainSelectionMechanism
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 from .transformer import TransformerBlock
-__all__ = ['C2f_DCMB', 'C3_Faster', 'C2f_Faster', 'C3_Faster_CGLU', 'C2f_Faster_CGLU', 'C2f_DCMB_Mamba']
+__all__ = ['C2f_DCMB', 'C3_Faster', 'C2f_Faster', 'C3_Faster_CGLU', 'C2f_Faster_CGLU', 'C2f_DCMB_Mamba',
+           'CSP_MutilScaleEdgeInformationEnhance', 'CSP_MutilScaleEdgeInformationSelect']
 
 ######################################## TransNeXt Convolutional GLU start ########################################
 
@@ -308,3 +310,90 @@ class C2f_Faster(C2f):
         self.m = nn.ModuleList(Faster_Block(self.c, self.c) for _ in range(n))
 
 ######################################## C2f-Faster end ########################################
+
+######################################## MutilScaleEdgeInformationEnhance start ########################################
+
+# 1.使用 nn.AvgPool2d 对输入特征图进行平滑操作，提取其低频信息。
+# 2.将原始输入特征图与平滑后的特征图进行相减，得到增强的边缘信息（高频信息）。
+# 3.用卷积操作进一步处理增强的边缘信息。
+# 4.将处理后的边缘信息与原始输入特征图相加，以形成增强后的输出。
+class EdgeEnhancer(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.out_conv = Conv(in_dim, in_dim, act=nn.Sigmoid())
+        self.pool = nn.AvgPool2d(3, stride=1, padding=1)
+
+    def forward(self, x):
+        edge = self.pool(x)
+        edge = x - edge
+        edge = self.out_conv(edge)
+        return x + edge
+
+
+class MutilScaleEdgeInformationEnhance(nn.Module):
+    def __init__(self, inc, bins):
+        super().__init__()
+
+        self.features = []
+        for bin in bins:
+            self.features.append(nn.Sequential(
+                nn.AdaptiveAvgPool2d(bin),
+                Conv(inc, inc // len(bins), 1),
+                Conv(inc // len(bins), inc // len(bins), 3, g=inc // len(bins))
+            ))
+        self.ees = []
+        for _ in bins:
+            self.ees.append(EdgeEnhancer(inc // len(bins)))
+        self.features = nn.ModuleList(self.features)
+        self.ees = nn.ModuleList(self.ees)
+        self.local_conv = Conv(inc, inc, 3)
+        self.final_conv = Conv(inc * 2, inc)
+
+    def forward(self, x):
+        x_size = x.size()
+        out = [self.local_conv(x)]
+        for idx, f in enumerate(self.features):
+            out.append(self.ees[idx](F.interpolate(f(x), x_size[2:], mode='bilinear', align_corners=True)))
+        return self.final_conv(torch.cat(out, 1))
+
+
+class MutilScaleEdgeInformationSelect(nn.Module):
+    def __init__(self, inc, bins):
+        super().__init__()
+
+        self.features = []
+        for bin in bins:
+            self.features.append(nn.Sequential(
+                nn.AdaptiveAvgPool2d(bin),
+                Conv(inc, inc // len(bins), 1),
+                Conv(inc // len(bins), inc // len(bins), 3, g=inc // len(bins))
+            ))
+        self.ees = []
+        for _ in bins:
+            self.ees.append(EdgeEnhancer(inc // len(bins)))
+        self.features = nn.ModuleList(self.features)
+        self.ees = nn.ModuleList(self.ees)
+        self.local_conv = Conv(inc, inc, 3)
+        self.dsm = DualDomainSelectionMechanism(inc * 2)
+        self.final_conv = Conv(inc * 2, inc)
+
+    def forward(self, x):
+        x_size = x.size()
+        out = [self.local_conv(x)]
+        for idx, f in enumerate(self.features):
+            out.append(self.ees[idx](F.interpolate(f(x), x_size[2:], mode='bilinear', align_corners=True)))
+        return self.final_conv(self.dsm(torch.cat(out, 1)))
+
+
+class CSP_MutilScaleEdgeInformationEnhance(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(MutilScaleEdgeInformationEnhance(self.c, [3, 6, 9, 12]) for _ in range(n))
+
+
+class CSP_MutilScaleEdgeInformationSelect(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(MutilScaleEdgeInformationSelect(self.c, [3, 6, 9, 12]) for _ in range(n))
+
+######################################## MutilScaleEdgeInformationEnhance end ########################################

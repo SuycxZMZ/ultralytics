@@ -71,7 +71,9 @@ from ultralytics.nn.modules import (
     C2f_DCMB,
     C2f_Faster,
     C3_Faster,
-    C2f_DCMB_Mamba
+    C2f_DCMB_Mamba,
+    CSP_MutilScaleEdgeInformationEnhance,
+    CSP_MutilScaleEdgeInformationSelect
 )
 from ultralytics.nn.modules.extra_blocks import C2f_DCMB_Mamba
 
@@ -1423,7 +1425,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             VSSBlock_YOLO,
             VisionClueMerge,
             SimpleStem,
-            C2f_DCMB_Mamba
+            C2f_DCMB_Mamba,
+            CSP_MutilScaleEdgeInformationEnhance,
+            CSP_MutilScaleEdgeInformationSelect
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1447,7 +1451,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C2f_Faster,
             C3_Faster,
             VSSBlock_YOLO,
-            C2f_DCMB_Mamba
+            C2f_DCMB_Mamba,
+            CSP_MutilScaleEdgeInformationEnhance,
+            CSP_MutilScaleEdgeInformationSelect
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args

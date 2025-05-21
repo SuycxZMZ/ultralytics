@@ -184,5 +184,7 @@ __all__ = (
     "C2f_DCMB", 
     "C3_Faster", 
     "C2f_Faster",
-    "C2f_DCMB_Mamba"
+    "C2f_DCMB_Mamba",
+    "CSP_MutilScaleEdgeInformationEnhance",
+    "CSP_MutilScaleEdgeInformationSelect"
 )
