@@ -75,7 +75,8 @@ from ultralytics.nn.modules import (
     CSP_MutilScaleEdgeInformationEnhance,
     CSP_MutilScaleEdgeInformationSelect,
     MANet,
-    C2f_CAMixer
+    C2f_CAMixer,
+    ContextGuideFusionModule
 )
 from ultralytics.nn.modules.extra_blocks import C2f_DCMB_Mamba
 
@@ -1509,6 +1510,10 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = args[1] if args[3] else args[1] * 4
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
+        elif m in {ContextGuideFusionModule}:
+            c1 = [ch[x] for x in f]
+            c2 = 2 * c1[1]
+            args = [c1]        
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
