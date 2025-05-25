@@ -76,7 +76,8 @@ from ultralytics.nn.modules import (
     CSP_MutilScaleEdgeInformationSelect,
     MANet,
     C2f_CAMixer,
-    ContextGuideFusionModule
+    ContextGuideFusionModule,
+    CSP_PMSFA
 )
 from ultralytics.nn.modules.extra_blocks import C2f_DCMB_Mamba
 
@@ -1432,7 +1433,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             CSP_MutilScaleEdgeInformationEnhance,
             CSP_MutilScaleEdgeInformationSelect,
             MANet,
-            C2f_CAMixer
+            C2f_CAMixer,
+            CSP_PMSFA
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1460,7 +1462,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             CSP_MutilScaleEdgeInformationEnhance,
             CSP_MutilScaleEdgeInformationSelect,
             MANet,
-            C2f_CAMixer
+            C2f_CAMixer,
+            CSP_PMSFA
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args

@@ -192,5 +192,6 @@ __all__ = (
     "CAMixer",
     "MANet",
     "C2f_CAMixer",
-    "ContextGuideFusionModule"
+    "ContextGuideFusionModule",
+    "CSP_PMSFA"
 )
