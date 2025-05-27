@@ -8,7 +8,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
 # 初始化模型
-model = SAM("sam2.1_b.pt", device=device)
+model = SAM("sam2.1_b.pt").to(device)
 
 # 单张图片推理保存[7,8](@ref)
 results = model("test-img.jpg")
