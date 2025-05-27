@@ -176,3 +176,12 @@ pnnx*
 calibration_*.npy
 
 *.jpg
+*.mp4
+*.avi
+*.png
+*.jpeg
+*.MP4
+
+output/*
+runs/*
+images/*
