@@ -193,5 +193,15 @@ __all__ = (
     "MANet",
     "C2f_CAMixer",
     "ContextGuideFusionModule",
-    "CSP_PMSFA"
+    "CSP_PMSFA",
+    "CSP_FFB",
+    "SBA",
+    "WaveletLikePool",
+    "LKRepELAN",
+    "C2f_UniRepLKNetBlock",
+    "C3_UniRepLKNetBlock",
+    "C2f_DRB",
+    "C3_DRB",
+    "C2f_DWR_DRB",
+    "C3_DWR_DRB",
 )

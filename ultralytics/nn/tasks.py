@@ -77,7 +77,17 @@ from ultralytics.nn.modules import (
     MANet,
     C2f_CAMixer,
     ContextGuideFusionModule,
-    CSP_PMSFA
+    CSP_PMSFA,
+    CSP_FFB,
+    SBA,
+    WaveletLikePool,
+    LKRepELAN,
+    C2f_UniRepLKNetBlock,
+    C3_UniRepLKNetBlock,
+    C2f_DRB,
+    C3_DRB,
+    C2f_DWR_DRB,
+    C3_DWR_DRB,
 )
 from ultralytics.nn.modules.extra_blocks import C2f_DCMB_Mamba
 
@@ -1434,7 +1444,15 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             CSP_MutilScaleEdgeInformationSelect,
             MANet,
             C2f_CAMixer,
-            CSP_PMSFA
+            CSP_PMSFA,
+            CSP_FFB,
+            LKRepELAN,
+            C2f_UniRepLKNetBlock,
+            C3_UniRepLKNetBlock,
+            C2f_DRB,
+            C2f_DWR_DRB,
+            C3_DRB,
+            C3_DWR_DRB
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1463,7 +1481,15 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             CSP_MutilScaleEdgeInformationSelect,
             MANet,
             C2f_CAMixer,
-            CSP_PMSFA
+            CSP_PMSFA,
+            CSP_FFB,
+            LKRepELAN,
+            C2f_UniRepLKNetBlock,
+            C3_UniRepLKNetBlock,
+            C2f_DRB,
+            C2f_DWR_DRB,
+            C3_DRB,
+            C3_DWR_DRB
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1516,9 +1542,15 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m in {ContextGuideFusionModule}:
             c1 = [ch[x] for x in f]
             c2 = 2 * c1[1]
-            args = [c1]        
+            args = [c1] 
+        elif m in {SBA}:
+            c1 = [ch[x] for x in f]
+            c2 = c1[-1]
+            args = [c1, c2]       
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m in {WaveletLikePool}:
+            c2 = ch[f] * 4
         elif m in frozenset(
             {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
         ):

@@ -6,15 +6,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from functools import partial
-from .attention import DualDomainSelectionMechanism, SEAttention, GLSA
+from .attention import DualDomainSelectionMechanism, SEAttention, GLSA, PSA_Attention
 from .camixer import CAMixer
 from .efficientvim import *
+
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 from .transformer import TransformerBlock
 __all__ = ['C2f_DCMB', 'C3_Faster', 'C2f_Faster', 'C3_Faster_CGLU', 'C2f_Faster_CGLU', 'C2f_DCMB_Mamba',
            'CSP_MutilScaleEdgeInformationEnhance', 'CSP_MutilScaleEdgeInformationSelect',
-           'MANet', 'C2f_CAMixer', 'ContextGuideFusionModule', 'CSP_PMSFA']
+           'MANet', 'C2f_CAMixer', 'ContextGuideFusionModule', 'CSP_PMSFA', 'CSP_FFB', 'SBA', 'WaveletLikePool', 'LKRepELAN', 'C2f_UniRepLKNetBlock', 'C3_UniRepLKNetBlock', 'C2f_DRB',
+           'C3_DRB', 'C2f_DWR_DRB', 'C3_DWR_DRB']
 
 ######################################## TransNeXt Convolutional GLU start ########################################
 
@@ -510,3 +512,453 @@ class CSP_PMSFA(C2f):
         super().__init__(c1, c2, n, shortcut, g, e)
         
         self.m = nn.ModuleList(PMSFA(self.c) for _ in range(n))
+
+class MHSA_CGLU(nn.Module):
+    def __init__(self,
+                 inc,
+                 drop_path=0.1,
+                 ):
+        super().__init__()
+        self.norm1 = LayerNorm2d(inc)
+        self.norm2 = LayerNorm2d(inc)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.mlp = ConvolutionalGLU(inc)
+        self.mhsa = PSA_Attention(inc, num_heads=8)
+
+    def forward(self, x):
+        shortcut = x
+        x = self.drop_path(self.mhsa(self.norm1(x))) + shortcut
+        x = self.drop_path(self.mlp(self.norm2(x))) + x
+        return x
+
+class PartiallyTransformerBlock(nn.Module):
+    def __init__(self, c, tcr, shortcut=True) -> None:
+        super().__init__()
+        self.t_ch = int(c * tcr)
+        self.c_ch = c - self.t_ch
+        
+        self.c_b = Bottleneck(self.c_ch, self.c_ch, shortcut=shortcut)
+        self.t_b = MHSA_CGLU(self.t_ch)
+        
+        self.conv_fuse = Conv(c, c)
+    
+    def forward(self, x):
+        cnn_branch, transformer_branch = x.split((self.c_ch, self.t_ch), 1)
+        
+        cnn_branch = self.c_b(cnn_branch)
+        transformer_branch = self.t_b(transformer_branch)
+        
+        return self.conv_fuse(torch.cat([cnn_branch, transformer_branch], dim=1))
+        
+
+class CSP_FFB(nn.Module):
+    """CSP-FFB(Partially Transformer Block)."""
+
+    def __init__(self, c1, c2, n=1, tcr=0.25, shortcut=False, g=1, e=0.5):
+        """Initialize CSP bottleneck layer with two convolutions with arguments ch_in, ch_out, number, shortcut, groups,
+        expansion.
+        """
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(PartiallyTransformerBlock(self.c, tcr, shortcut=shortcut) for _ in range(n))
+
+    def forward(self, x):
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+######################################## SBA Begin ########################################
+def Upsample(x, size, align_corners = False):
+    """
+    Wrapper Around the Upsample Call
+    """
+    return nn.functional.interpolate(x, size=size, mode='bilinear', align_corners=align_corners)
+
+class SBA(nn.Module):
+
+    def __init__(self, inc, input_dim=64):
+        super().__init__()
+
+        self.input_dim = input_dim
+
+        self.d_in1 = Conv(input_dim//2, input_dim//2, 1)
+        self.d_in2 = Conv(input_dim//2, input_dim//2, 1)       
+                
+        self.conv = Conv(input_dim, input_dim, 3)
+        self.fc1 = nn.Conv2d(inc[1], input_dim//2, kernel_size=1, bias=False)
+        self.fc2 = nn.Conv2d(inc[0], input_dim//2, kernel_size=1, bias=False)
+        
+        self.Sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        H_feature, L_feature = x
+
+        L_feature = self.fc1(L_feature)
+        H_feature = self.fc2(H_feature)
+        
+        g_L_feature =  self.Sigmoid(L_feature)
+        g_H_feature = self.Sigmoid(H_feature)
+        
+        L_feature = self.d_in1(L_feature)
+        H_feature = self.d_in2(H_feature)
+
+        L_feature = L_feature + L_feature * g_L_feature + (1 - g_L_feature) * Upsample(g_H_feature * H_feature, size= L_feature.size()[2:], align_corners=False)
+        H_feature = H_feature + H_feature * g_H_feature + (1 - g_H_feature) * Upsample(g_L_feature * L_feature, size= H_feature.size()[2:], align_corners=False) 
+        
+        H_feature = Upsample(H_feature, size = L_feature.size()[2:])
+        out = self.conv(torch.cat([H_feature, L_feature], dim=1))
+        return out
+
+######################################## SBA End ########################################
+
+######################################## WaveletLikePool Begin ########################################
+
+class WaveletLikePool(nn.Module):
+    def __init__(self, in_channels):
+        super(WaveletLikePool, self).__init__()
+        self.conv1x1 = nn.Conv2d(in_channels * 4, in_channels * 2, kernel_size=1)
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+        x_LL = x[:, :, 0::2, 0::2]
+        x_LH = x[:, :, 0::2, 1::2]
+        x_HL = x[:, :, 1::2, 0::2]
+        x_HH = x[:, :, 1::2, 1::2]
+
+        # 拼接： [B, 4C, H/2, W/2]
+        x_cat = torch.cat([x_LL, x_LH, x_HL, x_HH], dim=1)
+
+        # 1x1卷积调整通道数到 2C
+        out = self.conv1x1(x_cat)
+        return out
+
+######################################## WaveletLikePool End ########################################
+
+######################################## WaveletLikeUnPool Begin ########################################
+
+class WaveletLikeUnPool(nn.Module):
+    def __init__(self, in_channels):
+        super(WaveletLikeUnPool, self).__init__()
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels * 2, kernel_size=1)
+
+    def forward(self, x):
+        # x: [B, C, H, W] → 升到 [B, 2C, H, W]
+        x = self.conv1x1(x)
+        B, C2, H, W = x.shape
+        C = C2 // 4
+
+        x_LL = x[:, 0*C:1*C, :, :]
+        x_LH = x[:, 1*C:2*C, :, :]
+        x_HL = x[:, 2*C:3*C, :, :]
+        x_HH = x[:, 3*C:4*C, :, :]
+
+        out = torch.zeros(B, C, H * 2, W * 2, dtype=x.dtype, device=x.device)
+        out[:, :, 0::2, 0::2] = x_LL
+        out[:, :, 0::2, 1::2] = x_LH
+        out[:, :, 1::2, 0::2] = x_HL
+        out[:, :, 1::2, 1::2] = x_HH
+
+        return out
+
+######################################## WaveletLikeUnPool End ########################################
+
+######################################## UniRepLKNetBlock, DilatedReparamBlock start ########################################
+
+from .UniRepLKNet import get_bn, get_conv2d, NCHWtoNHWC, GRNwithNHWC, SEBlock, NHWCtoNCHW, fuse_bn, merge_dilated_into_large_kernel
+class DilatedReparamBlock(nn.Module):
+    """
+    Dilated Reparam Block proposed in UniRepLKNet (https://github.com/AILab-CVC/UniRepLKNet)
+    We assume the inputs to this block are (N, C, H, W)
+    """
+    def __init__(self, channels, kernel_size, deploy=False, use_sync_bn=False, attempt_use_lk_impl=True):
+        super().__init__()
+        self.lk_origin = get_conv2d(channels, channels, kernel_size, stride=1,
+                                    padding=kernel_size//2, dilation=1, groups=channels, bias=deploy,
+                                    attempt_use_lk_impl=attempt_use_lk_impl)
+        self.attempt_use_lk_impl = attempt_use_lk_impl
+
+        #   Default settings. We did not tune them carefully. Different settings may work better.
+        if kernel_size == 17:
+            self.kernel_sizes = [5, 9, 3, 3, 3]
+            self.dilates = [1, 2, 4, 5, 7]
+        elif kernel_size == 15:
+            self.kernel_sizes = [5, 7, 3, 3, 3]
+            self.dilates = [1, 2, 3, 5, 7]
+        elif kernel_size == 13:
+            self.kernel_sizes = [5, 7, 3, 3, 3]
+            self.dilates = [1, 2, 3, 4, 5]
+        elif kernel_size == 11:
+            self.kernel_sizes = [5, 5, 3, 3, 3]
+            self.dilates = [1, 2, 3, 4, 5]
+        elif kernel_size == 9:
+            self.kernel_sizes = [5, 5, 3, 3]
+            self.dilates = [1, 2, 3, 4]
+        elif kernel_size == 7:
+            self.kernel_sizes = [5, 3, 3]
+            self.dilates = [1, 2, 3]
+        elif kernel_size == 5:
+            self.kernel_sizes = [3, 3]
+            self.dilates = [1, 2]
+        else:
+            raise ValueError('Dilated Reparam Block requires kernel_size >= 5')
+
+        if not deploy:
+            self.origin_bn = get_bn(channels, use_sync_bn)
+            for k, r in zip(self.kernel_sizes, self.dilates):
+                self.__setattr__('dil_conv_k{}_{}'.format(k, r),
+                                 nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=k, stride=1,
+                                           padding=(r * (k - 1) + 1) // 2, dilation=r, groups=channels,
+                                           bias=False))
+                self.__setattr__('dil_bn_k{}_{}'.format(k, r), get_bn(channels, use_sync_bn=use_sync_bn))
+
+    def forward(self, x):
+        if not hasattr(self, 'origin_bn'):      # deploy mode
+            return self.lk_origin(x)
+        out = self.origin_bn(self.lk_origin(x))
+        for k, r in zip(self.kernel_sizes, self.dilates):
+            conv = self.__getattr__('dil_conv_k{}_{}'.format(k, r))
+            bn = self.__getattr__('dil_bn_k{}_{}'.format(k, r))
+            out = out + bn(conv(x))
+        return out
+
+    def switch_to_deploy(self):
+        if hasattr(self, 'origin_bn'):
+            origin_k, origin_b = fuse_bn(self.lk_origin, self.origin_bn)
+            for k, r in zip(self.kernel_sizes, self.dilates):
+                conv = self.__getattr__('dil_conv_k{}_{}'.format(k, r))
+                bn = self.__getattr__('dil_bn_k{}_{}'.format(k, r))
+                branch_k, branch_b = fuse_bn(conv, bn)
+                origin_k = merge_dilated_into_large_kernel(origin_k, branch_k, r)
+                origin_b += branch_b
+            merged_conv = get_conv2d(origin_k.size(0), origin_k.size(0), origin_k.size(2), stride=1,
+                                    padding=origin_k.size(2)//2, dilation=1, groups=origin_k.size(0), bias=True,
+                                    attempt_use_lk_impl=self.attempt_use_lk_impl)
+            merged_conv.weight.data = origin_k
+            merged_conv.bias.data = origin_b
+            self.lk_origin = merged_conv
+            self.__delattr__('origin_bn')
+            for k, r in zip(self.kernel_sizes, self.dilates):
+                self.__delattr__('dil_conv_k{}_{}'.format(k, r))
+                self.__delattr__('dil_bn_k{}_{}'.format(k, r))
+
+
+class UniRepLKNetBlock(nn.Module):
+    def __init__(self,
+                 dim,
+                 kernel_size,
+                 drop_path=0.,
+                 layer_scale_init_value=1e-6,
+                 deploy=False,
+                 attempt_use_lk_impl=True,
+                 with_cp=False,
+                 use_sync_bn=False,
+                 ffn_factor=4):
+        super().__init__()
+        self.with_cp = with_cp
+        # if deploy:
+        #     print('------------------------------- Note: deploy mode')
+        # if self.with_cp:
+        #     print('****** note with_cp = True, reduce memory consumption but may slow down training ******')
+
+        self.need_contiguous = (not deploy) or kernel_size >= 7
+
+        if kernel_size == 0:
+            self.dwconv = nn.Identity()
+            self.norm = nn.Identity()
+        elif deploy:
+            self.dwconv = get_conv2d(dim, dim, kernel_size=kernel_size, stride=1, padding=kernel_size // 2,
+                                     dilation=1, groups=dim, bias=True,
+                                     attempt_use_lk_impl=attempt_use_lk_impl)
+            self.norm = nn.Identity()
+        elif kernel_size >= 7:
+            self.dwconv = DilatedReparamBlock(dim, kernel_size, deploy=deploy,
+                                              use_sync_bn=use_sync_bn,
+                                              attempt_use_lk_impl=attempt_use_lk_impl)
+            self.norm = get_bn(dim, use_sync_bn=use_sync_bn)
+        elif kernel_size == 1:
+            self.dwconv = nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, padding=kernel_size // 2,
+                                    dilation=1, groups=1, bias=deploy)
+            self.norm = get_bn(dim, use_sync_bn=use_sync_bn)
+        else:
+            assert kernel_size in [3, 5]
+            self.dwconv = nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, padding=kernel_size // 2,
+                                    dilation=1, groups=dim, bias=deploy)
+            self.norm = get_bn(dim, use_sync_bn=use_sync_bn)
+
+        self.se = SEBlock(dim, dim // 4)
+
+        ffn_dim = int(ffn_factor * dim)
+        self.pwconv1 = nn.Sequential(
+            NCHWtoNHWC(),
+            nn.Linear(dim, ffn_dim))
+        self.act = nn.Sequential(
+            nn.GELU(),
+            GRNwithNHWC(ffn_dim, use_bias=not deploy))
+        if deploy:
+            self.pwconv2 = nn.Sequential(
+                nn.Linear(ffn_dim, dim),
+                NHWCtoNCHW())
+        else:
+            self.pwconv2 = nn.Sequential(
+                nn.Linear(ffn_dim, dim, bias=False),
+                NHWCtoNCHW(),
+                get_bn(dim, use_sync_bn=use_sync_bn))
+
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(dim),
+                                  requires_grad=True) if (not deploy) and layer_scale_init_value is not None \
+                                                         and layer_scale_init_value > 0 else None
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, inputs):
+
+        def _f(x):
+            if self.need_contiguous:
+                x = x.contiguous()
+            y = self.se(self.norm(self.dwconv(x)))
+            y = self.pwconv2(self.act(self.pwconv1(y)))
+            if self.gamma is not None:
+                y = self.gamma.view(1, -1, 1, 1) * y
+            return self.drop_path(y) + x
+
+        if self.with_cp and inputs.requires_grad:
+            return checkpoint.checkpoint(_f, inputs)
+        else:
+            return _f(inputs)
+
+    def switch_to_deploy(self):
+        if hasattr(self.dwconv, 'switch_to_deploy'):
+            self.dwconv.switch_to_deploy()
+        if hasattr(self.norm, 'running_var') and hasattr(self.dwconv, 'lk_origin'):
+            std = (self.norm.running_var + self.norm.eps).sqrt()
+            self.dwconv.lk_origin.weight.data *= (self.norm.weight / std).view(-1, 1, 1, 1)
+            self.dwconv.lk_origin.bias.data = self.norm.bias + (self.dwconv.lk_origin.bias - self.norm.running_mean) * self.norm.weight / std
+            self.norm = nn.Identity()
+        if self.gamma is not None:
+            final_scale = self.gamma.data
+            self.gamma = None
+        else:
+            final_scale = 1
+        if self.act[1].use_bias and len(self.pwconv2) == 3:
+            grn_bias = self.act[1].beta.data
+            self.act[1].__delattr__('beta')
+            self.act[1].use_bias = False
+            linear = self.pwconv2[0]
+            grn_bias_projected_bias = (linear.weight.data @ grn_bias.view(-1, 1)).squeeze()
+            bn = self.pwconv2[2]
+            std = (bn.running_var + bn.eps).sqrt()
+            new_linear = nn.Linear(linear.in_features, linear.out_features, bias=True)
+            new_linear.weight.data = linear.weight * (bn.weight / std * final_scale).view(-1, 1)
+            linear_bias = 0 if linear.bias is None else linear.bias.data
+            linear_bias += grn_bias_projected_bias
+            new_linear.bias.data = (bn.bias + (linear_bias - bn.running_mean) * bn.weight / std) * final_scale
+            self.pwconv2 = nn.Sequential(new_linear, self.pwconv2[1])
+
+class C3_UniRepLKNetBlock(C3):
+    def __init__(self, c1, c2, n=1, k=7, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(UniRepLKNetBlock(c_, k) for _ in range(n)))
+
+class C2f_UniRepLKNetBlock(C2f):
+    def __init__(self, c1, c2, n=1, k=7, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(UniRepLKNetBlock(self.c, k) for _ in range(n))
+
+class Bottleneck_DRB(Bottleneck):
+    """Standard bottleneck with DilatedReparamBlock."""
+
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):  # ch_in, ch_out, shortcut, groups, kernels, expand
+        super().__init__(c1, c2, shortcut, g, k, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.cv2 = DilatedReparamBlock(c2, 7)
+
+class C3_DRB(C3):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(Bottleneck_DRB(c_, c_, shortcut, g, k=(1, 3), e=1.0) for _ in range(n)))
+
+class C2f_DRB(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(Bottleneck_DRB(self.c, self.c, shortcut, g, k=(3, 3), e=1.0) for _ in range(n))
+
+######################################## UniRepLKNetBlock, DilatedReparamBlock end ########################################
+
+######################################## Dilation-wise Residual DilatedReparamBlock start ########################################
+
+class DWR_DRB(nn.Module):
+    def __init__(self, dim, act=True) -> None:
+        super().__init__()
+
+        self.conv_3x3 = Conv(dim, dim // 2, 3, act=act)
+        
+        self.conv_3x3_d1 = Conv(dim // 2, dim, 3, d=1, act=act)
+        self.conv_3x3_d3 = DilatedReparamBlock(dim // 2, 5)
+        self.conv_3x3_d5 = DilatedReparamBlock(dim // 2, 7)
+        
+        self.conv_1x1 = Conv(dim * 2, dim, k=1, act=act)
+        
+    def forward(self, x):
+        conv_3x3 = self.conv_3x3(x)
+        x1, x2, x3 = self.conv_3x3_d1(conv_3x3), self.conv_3x3_d3(conv_3x3), self.conv_3x3_d5(conv_3x3)
+        x_out = torch.cat([x1, x2, x3], dim=1)
+        x_out = self.conv_1x1(x_out) + x
+        return x_out
+
+class C3_DWR_DRB(C3):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(DWR_DRB(c_) for _ in range(n)))
+
+class C2f_DWR_DRB(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(DWR_DRB(self.c) for _ in range(n))
+    
+######################################## Dilation-wise Residual DilatedReparamBlock end ########################################
+
+######################################## LKRepELAN start ########################################
+class LKRepELAN(nn.Module):
+    def __init__(self, c1, c2, n=1, scale=0.5, e=0.5):
+        super(LKRepELAN, self).__init__()
+        
+        self.c = int(c2 * e)  # hidden channels
+        self.mid = int(self.c * scale)
+        
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv(self.c + self.mid * (n + 1), c2, 1)
+        
+        # 可选项，这里可以加入 DBB，DWR_DRB，可变性卷积，UniRepLKNetBlock 或者其他模块
+        # self.cv3 = DWR_DRB(self.mid)
+        self.cv3 = RepConv(self.c, self.mid, 3)
+        self.m = nn.ModuleList(Conv(self.mid, self.mid, 3) for _ in range(n - 1))
+        self.cv4 = Conv(self.mid, self.mid, 1)
+        
+    def forward(self, x):
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y[-1] = self.cv3(y[-1])
+        y.extend(m(y[-1]) for m in self.m)
+        y.append(self.cv4(y[-1]))
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y[-1] = self.cv3(y[-1])
+        y.extend(m(y[-1]) for m in self.m)
+        y.extend(self.cv4(y[-1]))
+        return self.cv2(torch.cat(y, 1))
+######################################## LKRepELAN end ########################################
